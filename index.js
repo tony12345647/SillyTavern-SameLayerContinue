@@ -34,6 +34,14 @@ const defaultSettings = {
     customNudge: '',          // 自訂續寫指示，空白 = 用 ST 預設
 
     // 行為
+    // 續寫前清理
+    stripEnabled: true,       // 啟用刪詞
+    stripTerms: '',           // 一行一條，支援 /regex/flags
+    stripMode: 'prompt',      // 'prompt' = 只從送給AI的內容刪，聊天記錄保留原文 | 'message' = 直接改訊息
+    stripScope: 'all',        // 'all' = 整篇 | 'tail' = 只處理結尾
+    stripTailChars: 300,      // scope=tail 時處理最後幾個字
+    stripBackup: true,        // 清理前備份原文，可還原
+
     trimTrailing: true,       // 續寫前先去掉結尾多餘空白
     syncSwipe: true,          // 續寫後把結果同步回目前的 swipe
     showWandButton: true,     // 在魔杖選單顯示按鈕
@@ -137,6 +145,201 @@ function analyzeTail(text) {
     }
 
     return { truncated: reasons.length > 0, reasons };
+}
+
+
+/* ------------------------------------------------------------------ */
+/* 續寫前清理                                                           */
+/* ------------------------------------------------------------------ */
+
+/** 把設定裡的刪除清單解析成 RegExp 陣列。純文字會自動跳脫。 */
+function parseStripTerms() {
+    const raw = String(settings().stripTerms ?? '');
+    const patterns = [];
+    for (const line of raw.split('\n')) {
+        const t = line.trim();
+        if (!t || t.startsWith('#')) continue;
+        const asRegex = t.match(/^\/(.+)\/([gimsuy]*)$/);
+        try {
+            if (asRegex) {
+                const flags = asRegex[2].includes('g') ? asRegex[2] : asRegex[2] + 'g';
+                patterns.push(new RegExp(asRegex[1], flags));
+            } else {
+                patterns.push(new RegExp(t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'));
+            }
+        } catch (err) {
+            debug('略過無效規則：', t, err);
+        }
+    }
+    return patterns;
+}
+
+function runPatterns(text, patterns) {
+    let out = text;
+    let count = 0;
+    for (const re of patterns) {
+        re.lastIndex = 0;
+        const hits = out.match(re);
+        if (hits?.length) {
+            count += hits.length;
+            out = out.replace(re, '');
+        }
+    }
+    return { out, count };
+}
+
+/**
+ * 對一段文字套用刪除清單。
+ * @returns {{text: string, count: number}}
+ */
+function stripFromText(text) {
+    const s = settings();
+    const patterns = parseStripTerms();
+    if (!patterns.length || typeof text !== 'string') return { text, count: 0 };
+
+    if (s.stripScope === 'tail') {
+        const n = Math.max(1, Number(s.stripTailChars) || 300);
+        const cut = Math.max(0, text.length - n);
+        const head = text.slice(0, cut);
+        const { out, count } = runPatterns(text.slice(cut), patterns);
+        return { text: head + out, count };
+    }
+
+    const { out, count } = runPatterns(text, patterns);
+    return { text: out, count };
+}
+
+/** 把 DOM 上那則訊息重畫，讓刪除結果立刻看得到。 */
+function refreshMessageBlock(idx, mes) {
+    const ctx = getContext();
+    try {
+        if (typeof ctx.updateMessageBlock === 'function') {
+            ctx.updateMessageBlock(idx, mes);
+            return;
+        }
+    } catch (err) {
+        debug('updateMessageBlock 失敗', err);
+    }
+    const $block = $(`#chat .mes[mesid="${idx}"] .mes_text`);
+    if ($block.length && typeof ctx.messageFormatting === 'function') {
+        $block.html(ctx.messageFormatting(mes.mes, mes.name, mes.is_system, mes.is_user, idx));
+    }
+}
+
+/**
+ * 續寫前把刪除清單套到最後一層訊息上。
+ *
+ * stripMode='prompt' 時這是暫時的：訊息會先被改成刪除後的版本送去續寫，
+ * 生成結束再由 finalizeStrip() 把原文接回來，聊天記錄看起來沒被動過。
+ * stripMode='message' 時就是永久改掉，靠備份還原。
+ *
+ * @returns {{applied: boolean, count: number, original: string|null, sent: string|null}}
+ */
+function prepareStrip() {
+    const s = settings();
+    const none = { applied: false, count: 0, original: null, sent: null };
+    if (!s.stripEnabled) return none;
+
+    const item = lastAiMessage();
+    if (!item) return none;
+
+    const { idx, mes } = item;
+    const original = mes.mes;
+    const { text, count } = stripFromText(original);
+    if (!count || text === original) return none;
+
+    if (s.stripMode === 'message' && s.stripBackup) {
+        mes.extra = mes.extra || {};
+        mes.extra.slc_backup = original;
+    }
+
+    mes.mes = text;
+    if (Array.isArray(mes.swipes) && Number.isInteger(mes.swipe_id)) {
+        mes.swipes[mes.swipe_id] = text;
+    }
+    debug(`清理移除 ${count} 處，模式 ${s.stripMode}`);
+    return { applied: true, count, original, sent: text, idx };
+}
+
+/**
+ * 生成結束後收尾。prompt 模式會把原文接回去，只保留 AI 新寫的那一段。
+ */
+function finalizeStrip(state) {
+    const s = settings();
+    if (!state?.applied || s.stripMode !== 'prompt') return;
+
+    const item = lastAiMessage();
+    if (!item) return;
+    const { idx, mes } = item;
+
+    // 續寫是往後append，所以現在的內容應該以送出去的那份為開頭
+    const sentAfterTrim = state.sentTrimmed ?? state.sent;
+    let addition = null;
+    if (typeof mes.mes === 'string') {
+        if (mes.mes.startsWith(sentAfterTrim)) {
+            addition = mes.mes.slice(sentAfterTrim.length);
+        } else if (mes.mes.startsWith(state.sent)) {
+            addition = mes.mes.slice(state.sent.length);
+        }
+    }
+
+    if (addition === null) {
+        toastr.warning('接不回原文（內容和送出時對不上），這次的刪除留在訊息裡了。可按「還原上次清理」處理。', '同層續寫');
+        mes.extra = mes.extra || {};
+        mes.extra.slc_backup = state.original;
+        debug('finalizeStrip 對不上，保留刪除後版本');
+        return;
+    }
+
+    mes.mes = state.original + addition;
+    if (Array.isArray(mes.swipes) && Number.isInteger(mes.swipe_id)) {
+        mes.swipes[mes.swipe_id] = mes.mes;
+    }
+    refreshMessageBlock(idx, mes);
+    debug(`已接回原文，新增 ${addition.length} 字`);
+}
+
+/** 直接把刪除清單永久套用到訊息（面板上的「直接清理訊息」按鈕用）。 */
+function applyStripToLastMessage({ render = true } = {}) {
+    const item = lastAiMessage();
+    if (!item) return { applied: false, count: 0 };
+    const { idx, mes } = item;
+    const original = mes.mes;
+    const { text, count } = stripFromText(original);
+    if (!count || text === original) return { applied: false, count: 0 };
+
+    mes.extra = mes.extra || {};
+    mes.extra.slc_backup = original;
+    mes.mes = text;
+    if (Array.isArray(mes.swipes) && Number.isInteger(mes.swipe_id)) {
+        mes.swipes[mes.swipe_id] = text;
+    }
+    if (render) refreshMessageBlock(idx, mes);
+    return { applied: true, count };
+}
+
+/** 還原最近一次清理。 */
+function restoreLastStrip() {
+    const item = lastAiMessage();
+    if (!item) {
+        toastr.warning('最後一則不是角色訊息');
+        return;
+    }
+    const { idx, mes } = item;
+    const backup = mes.extra?.slc_backup;
+    if (typeof backup !== 'string') {
+        toastr.warning('這則訊息沒有清理備份可以還原');
+        return;
+    }
+    mes.mes = backup;
+    if (Array.isArray(mes.swipes) && Number.isInteger(mes.swipe_id)) {
+        mes.swipes[mes.swipe_id] = backup;
+    }
+    delete mes.extra.slc_backup;
+    refreshMessageBlock(idx, mes);
+    const ctx = getContext();
+    (ctx.saveChatConditional ?? ctx.saveChat)?.();
+    toastr.success('已還原清理前的內容', '同層續寫');
 }
 
 /* ------------------------------------------------------------------ */
@@ -289,6 +492,8 @@ async function continueSameLayer({ source = 'manual', silent = false } = {}) {
 
     const { mes } = item;
 
+    const stripState = prepareStrip();
+
     if (s.trimTrailing && typeof mes.mes === 'string') {
         const trimmed = mes.mes.replace(/\s+$/u, '');
         if (trimmed !== mes.mes) {
@@ -296,6 +501,7 @@ async function continueSameLayer({ source = 'manual', silent = false } = {}) {
             debug('已去掉結尾空白');
         }
     }
+    if (stripState.applied) stripState.sentTrimmed = mes.mes;
 
     busy = true;
     const restore = applyPromptOverrides();
@@ -303,10 +509,23 @@ async function continueSameLayer({ source = 'manual', silent = false } = {}) {
         debug(`開始續寫（來源：${source}），目前長度 ${mes.mes?.length ?? 0}`);
         const awaited = await invokeNativeContinue();
         if (!awaited) await waitForGenerationEnd();
+        finalizeStrip(stripState);
         syncSwipeText();
         return true;
     } catch (err) {
         console.error(LOG, err);
+        // 生成失敗時，prompt 模式要把原文放回去，不能留下被刪過的版本
+        if (stripState.applied && settings().stripMode === 'prompt') {
+            const item2 = lastAiMessage();
+            if (item2 && item2.mes.mes === (stripState.sentTrimmed ?? stripState.sent)) {
+                item2.mes.mes = stripState.original;
+                if (Array.isArray(item2.mes.swipes) && Number.isInteger(item2.mes.swipe_id)) {
+                    item2.mes.swipes[item2.mes.swipe_id] = stripState.original;
+                }
+                refreshMessageBlock(item2.idx, item2.mes);
+                debug('生成失敗，已還原原文');
+            }
+        }
         if (!silent) toastr.error(String(err?.message ?? err), '續寫失敗');
         return false;
     } finally {
@@ -570,6 +789,40 @@ const SETTINGS_HTML = `
             <textarea id="slc_customNudge" class="text_pole textarea_compact" rows="3" placeholder="例：[接續上文繼續寫下去，不要重複已寫過的內容，不要重新開場。]"></textarea>
 
             <hr class="sysHR">
+            <h4>續寫前清理</h4>
+            <small class="slc_hint">續寫之前先把這些字詞從上一層內容裡拿掉，再讓 AI 接著寫。一行一條；用 /pattern/flags 可以寫正規表達式；# 開頭是註解。</small>
+
+            <label class="checkbox_label" for="slc_stripEnabled">
+                <input id="slc_stripEnabled" type="checkbox"><span>啟用清理</span>
+            </label>
+
+            <textarea id="slc_stripTerms" class="text_pole textarea_compact" rows="6" placeholder="（待續）&#10;※&#10;/\\[系統[^\\]]*\\]/&#10;# 井字號開頭這行不會生效"></textarea>
+
+            <label for="slc_stripMode">刪除範圍</label>
+            <select id="slc_stripMode" class="text_pole">
+                <option value="prompt">只從送給 AI 的內容刪，聊天記錄保留原文</option>
+                <option value="message">直接從訊息刪掉（永久，可還原）</option>
+            </select>
+
+            <label for="slc_stripScope">掃描範圍</label>
+            <select id="slc_stripScope" class="text_pole">
+                <option value="all">整篇訊息</option>
+                <option value="tail">只處理結尾 N 字</option>
+            </select>
+
+            <label for="slc_stripTailChars">結尾範圍的字數</label>
+            <input id="slc_stripTailChars" class="text_pole" type="number" min="10" max="5000" step="10">
+
+            <label class="checkbox_label" for="slc_stripBackup">
+                <input id="slc_stripBackup" type="checkbox"><span>清理前備份原文（可還原）</span>
+            </label>
+
+            <div class="flex-container flexGap5">
+                <input id="slc_stripNow" class="menu_button" type="button" value="直接清理訊息">
+                <input id="slc_stripRestore" class="menu_button" type="button" value="還原上次清理">
+            </div>
+
+            <hr class="sysHR">
             <h4>續寫行為</h4>
             <label class="checkbox_label" for="slc_trimTrailing">
                 <input id="slc_trimTrailing" type="checkbox"><span>續寫前先去掉結尾多餘空白</span>
@@ -607,7 +860,7 @@ function bindSettingsUI() {
     const checkboxes = [
         'enabled', 'showWandButton', 'autoDetect', 'detectPunctuation',
         'detectUnclosed', 'detectCodeBlock', 'trimTrailing', 'syncSwipe', 'debug',
-        'forcePrefill', 'checkUpdateOnStart',
+        'forcePrefill', 'checkUpdateOnStart', 'stripEnabled', 'stripBackup',
     ];
     for (const key of checkboxes) {
         const $el = $(`#slc_${key}`);
@@ -624,6 +877,21 @@ function bindSettingsUI() {
         saveSettings();
     });
 
+    $('#slc_stripMode').val(s.stripMode).on('change', function () {
+        settings().stripMode = String($(this).val());
+        saveSettings();
+    });
+
+    $('#slc_stripScope').val(s.stripScope).on('change', function () {
+        settings().stripScope = String($(this).val());
+        saveSettings();
+    });
+
+    $('#slc_stripTerms').val(s.stripTerms).on('input', function () {
+        settings().stripTerms = String($(this).val());
+        saveSettings();
+    });
+
     $('#slc_joinMode').val(s.joinMode).on('change', function () {
         settings().joinMode = String($(this).val());
         saveSettings();
@@ -634,7 +902,7 @@ function bindSettingsUI() {
         saveSettings();
     });
 
-    for (const key of ['maxAutoRetries', 'minLength']) {
+    for (const key of ['maxAutoRetries', 'minLength', 'stripTailChars']) {
         $(`#slc_${key}`).val(s[key]).on('input', function () {
             const v = Number($(this).val());
             if (Number.isFinite(v)) {
@@ -659,6 +927,17 @@ function bindSettingsUI() {
     });
 
     $('#slc_run').on('click', () => continueSameLayer({ source: 'settings' }));
+    $('#slc_stripNow').on('click', () => {
+        const r = applyStripToLastMessage({ render: true });
+        if (r.applied) {
+            const ctx = getContext();
+            (ctx.saveChatConditional ?? ctx.saveChat)?.();
+            toastr.success(`刪除了 ${r.count} 處`, '已直接改動訊息');
+        } else {
+            toastr.info('沒有符合的字詞，或清理沒有啟用', '同層續寫');
+        }
+    });
+    $('#slc_stripRestore').on('click', () => restoreLastStrip());
     $('#slc_check').on('click', () => checkForUpdate({ silent: false }));
     $('#slc_update').on('click', () => runUpdate());
     renderVersionLine();
