@@ -1,0 +1,27 @@
+.same-layer-continue-settings .slc_hint {
+    display: block;
+    opacity: 0.7;
+    margin-bottom: 8px;
+    line-height: 1.4;
+}
+
+.same-layer-continue-settings h4 {
+    margin: 6px 0 4px;
+}
+
+.same-layer-continue-settings label[for] {
+    display: block;
+    margin-top: 6px;
+}
+
+.same-layer-continue-settings .text_pole {
+    width: 100%;
+}
+
+.same-layer-continue-settings .flex-container .menu_button {
+    flex: 1;
+}
+
+#slc_wand_button {
+    cursor: pointer;
+}
