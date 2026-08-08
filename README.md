@@ -7,7 +7,7 @@
 SillyTavern →「擴充功能」→「Install extension」，貼上：
 
 ```
-https://github.com/YOUR_GITHUB_USERNAME/SillyTavern-SameLayerContinue
+https://github.com/tony12345647/SillyTavern-SameLayerContinue
 ```
 
 裝完重新整理頁面，「擴充功能」面板會出現「同層續寫」設定抽屜，魔杖選單會多一個「續寫本層」。
@@ -62,6 +62,14 @@ preset／預設集、世界書（含 @Depth 深度注入、遞迴掃描、sticky
   因為走原生路徑，所以同層追加、context 組裝、串流都跟你平常按 Continue 完全一致。
 - 只對最後一則**角色**訊息作用。最後一則是使用者訊息時會直接擋下，不會誤生成新層。
 - 自動續寫次數在你送出新訊息或切換聊天時歸零。
+
+## 更新
+
+設定面板最下面有版本號、「檢查更新」和「立即更新」。按下去等同對擴充資料夾做一次 `git pull`，完成後會跳提示要你重新整理頁面。`auto_update` 也開著，ST 啟動時本來就會自己拉。
+
+發新版的流程：改完 code 推上 GitHub 時，**記得把 `manifest.json` 的 `version` 往上加**。ST 有些版本靠版本號決定要不要更新，忘了加會拉不動。
+
+手動安裝（直接丟資料夾、沒有 `.git`）的話沒辦法自動更新，只能重新下載覆蓋。
 
 ## 注意
 

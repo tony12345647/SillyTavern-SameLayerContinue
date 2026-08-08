@@ -10,6 +10,10 @@ import { extension_settings, getContext } from '../../../extensions.js';
 const MODULE_NAME = 'sameLayerContinue';
 const LOG = '[同層續寫]';
 
+/** 從自己的檔案位置推回擴充資料夾名稱，不用寫死路徑。 */
+const EXT_URL = new URL('.', import.meta.url);
+const EXT_NAME = decodeURIComponent(EXT_URL.pathname.replace(/\/+$/, '').split('/').pop() || '');
+
 const defaultSettings = {
     enabled: true,
 
@@ -33,6 +37,7 @@ const defaultSettings = {
     trimTrailing: true,       // 續寫前先去掉結尾多餘空白
     syncSwipe: true,          // 續寫後把結果同步回目前的 swipe
     showWandButton: true,     // 在魔杖選單顯示按鈕
+    checkUpdateOnStart: true, // 啟動時檢查有沒有新版
     debug: false,
 };
 
@@ -368,6 +373,129 @@ function onMessageSent() {
 /* UI                                                                  */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* 更新                                                                 */
+/* ------------------------------------------------------------------ */
+
+let cachedVersionInfo = null;
+
+async function postExtensionApi(path, extraBody = {}) {
+    const ctx = getContext();
+    const headers = ctx.getRequestHeaders?.() ?? { 'Content-Type': 'application/json' };
+
+    // 新版 ST 需要 global 旗標，舊版沒有。兩種都試。
+    for (const global of [false, true, undefined]) {
+        const body = { extensionName: EXT_NAME, ...extraBody };
+        if (global !== undefined) body.global = global;
+        try {
+            const res = await fetch(path, { method: 'POST', headers, body: JSON.stringify(body) });
+            if (res.ok) return await res.json();
+            debug(`${path} global=${global} 回應 ${res.status}`);
+        } catch (err) {
+            debug(`${path} global=${global} 失敗`, err);
+        }
+    }
+    return null;
+}
+
+/** 讀本機這份擴充的 manifest 版本號。 */
+async function localVersion() {
+    try {
+        const res = await fetch(new URL('manifest.json', EXT_URL).href, { cache: 'no-store' });
+        const json = await res.json();
+        return { version: json.version, homePage: json.homePage };
+    } catch (err) {
+        debug('讀不到本機 manifest', err);
+        return { version: null, homePage: null };
+    }
+}
+
+/** 備援：直接去 GitHub 抓遠端 manifest 比版本號。 */
+async function remoteManifestVersion(homePage) {
+    const m = String(homePage ?? '').match(/github\.com\/([^/]+)\/([^/#?]+)/i);
+    if (!m) return null;
+    const [, owner, repo] = m;
+    for (const branch of ['main', 'master']) {
+        try {
+            const url = `https://raw.githubusercontent.com/${owner}/${repo.replace(/\.git$/, '')}/${branch}/manifest.json`;
+            const res = await fetch(url, { cache: 'no-store' });
+            if (!res.ok) continue;
+            const json = await res.json();
+            if (json?.version) return json.version;
+        } catch (err) {
+            debug('遠端 manifest 抓取失敗', branch, err);
+        }
+    }
+    return null;
+}
+
+/**
+ * 檢查更新。
+ * @returns {Promise<{hasUpdate: boolean, local: string|null, detail: string}>}
+ */
+async function checkForUpdate({ silent = false } = {}) {
+    const { version: local, homePage } = await localVersion();
+
+    // 主要路徑：問 ST 自己的 git 狀態，最準
+    const info = await postExtensionApi('/api/extensions/version');
+    if (info && typeof info.isUpToDate === 'boolean') {
+        cachedVersionInfo = info;
+        const hasUpdate = !info.isUpToDate;
+        const detail = hasUpdate
+            ? `有新的 commit 可以拉（目前 ${String(info.currentCommitHash ?? '').slice(0, 7) || '未知'}）`
+            : `已是最新（${String(info.currentCommitHash ?? '').slice(0, 7) || '未知'}）`;
+        if (!silent) toastr[hasUpdate ? 'info' : 'success'](detail, '同層續寫');
+        return { hasUpdate, local, detail };
+    }
+
+    // 備援路徑：比 manifest 版本號
+    const remote = await remoteManifestVersion(homePage);
+    if (remote && local) {
+        const hasUpdate = remote !== local;
+        const detail = hasUpdate ? `遠端是 ${remote}，本機是 ${local}` : `已是最新（${local}）`;
+        if (!silent) toastr[hasUpdate ? 'info' : 'success'](detail, '同層續寫');
+        return { hasUpdate, local, detail };
+    }
+
+    const detail = '查不到版本資訊，可能是手動安裝（沒有 git）或 manifest 的 homePage 沒填對';
+    if (!silent) toastr.warning(detail, '同層續寫');
+    return { hasUpdate: false, local, detail };
+}
+
+/** 觸發 ST 更新這個擴充（等同 git pull），完成後請使用者重整。 */
+async function runUpdate() {
+    const $btn = $('#slc_update');
+    $btn.prop('disabled', true).val('更新中…');
+    try {
+        const result = await postExtensionApi('/api/extensions/update');
+        if (!result) {
+            toastr.error('ST 的更新介面沒有回應。手動安裝的擴充沒有 git 記錄，無法自動更新。', '更新失敗');
+            return;
+        }
+        if (result.isUpToDate) {
+            toastr.success('已經是最新版，沒有東西要拉。', '同層續寫');
+            return;
+        }
+        const hash = String(result.shortCommitHash ?? '').slice(0, 7);
+        toastr.success(`已更新到 ${hash || '最新版'}。點這裡重新整理頁面套用。`, '更新完成', {
+            timeOut: 0,
+            extendedTimeOut: 0,
+            tapToDismiss: false,
+            onclick: () => location.reload(),
+        });
+    } catch (err) {
+        console.error(LOG, err);
+        toastr.error(String(err?.message ?? err), '更新失敗');
+    } finally {
+        $btn.prop('disabled', false).val('立即更新');
+    }
+}
+
+async function renderVersionLine() {
+    const { version } = await localVersion();
+    $('#slc_version').text(version ? `v${version}` : '版本未知');
+}
+
 const WAND_BUTTON_HTML = `
 <div id="slc_wand_button" class="list-group-item flex-container flexGap5 interactable" tabindex="0" title="在同一層訊息上繼續寫，不新增訊息層">
     <div class="fa-solid fa-forward-step extensionsMenuExtensionButton"></div>
@@ -458,6 +586,17 @@ const SETTINGS_HTML = `
                 <input id="slc_test" class="menu_button" type="button" value="測試偵測最後一則">
                 <input id="slc_run" class="menu_button" type="button" value="立刻續寫本層">
             </div>
+
+            <hr class="sysHR">
+            <h4>更新 <small id="slc_version" class="slc_version"></small></h4>
+            <label class="checkbox_label" for="slc_checkUpdateOnStart">
+                <input id="slc_checkUpdateOnStart" type="checkbox"><span>啟動時自動檢查有沒有新版</span>
+            </label>
+            <div class="flex-container flexGap5">
+                <input id="slc_check" class="menu_button" type="button" value="檢查更新">
+                <input id="slc_update" class="menu_button" type="button" value="立即更新">
+            </div>
+            <small class="slc_hint">更新等同對擴充資料夾做一次 git pull，完成後需要重新整理頁面。手動安裝（沒有 git 記錄）的話只能重新下載覆蓋。</small>
         </div>
     </div>
 </div>`;
@@ -468,7 +607,7 @@ function bindSettingsUI() {
     const checkboxes = [
         'enabled', 'showWandButton', 'autoDetect', 'detectPunctuation',
         'detectUnclosed', 'detectCodeBlock', 'trimTrailing', 'syncSwipe', 'debug',
-        'forcePrefill',
+        'forcePrefill', 'checkUpdateOnStart',
     ];
     for (const key of checkboxes) {
         const $el = $(`#slc_${key}`);
@@ -520,6 +659,9 @@ function bindSettingsUI() {
     });
 
     $('#slc_run').on('click', () => continueSameLayer({ source: 'settings' }));
+    $('#slc_check').on('click', () => checkForUpdate({ silent: false }));
+    $('#slc_update').on('click', () => runUpdate());
+    renderVersionLine();
 }
 
 function refreshWandButton() {
@@ -579,5 +721,17 @@ jQuery(async () => {
         debug('這個版本沒有新版斜線指令 API，略過註冊', err);
     }
 
-    console.log(LOG, '已載入');
+    if (settings().checkUpdateOnStart) {
+        setTimeout(async () => {
+            const { hasUpdate, detail } = await checkForUpdate({ silent: true });
+            if (hasUpdate) {
+                toastr.info(`${detail}。點這裡到設定面板更新。`, '同層續寫有新版', {
+                    timeOut: 12000,
+                    onclick: () => $('#slc_update').closest('.inline-drawer-content').show(),
+                });
+            }
+        }, 8000);
+    }
+
+    console.log(LOG, `已載入（資料夾：${EXT_NAME}）`);
 });
