@@ -34,6 +34,13 @@ const defaultSettings = {
     customNudge: '',          // 自訂續寫指示，空白 = 用 ST 預設
 
     // 行為
+    // 續寫用的模型
+    switchTarget: 'none',     // 'none' | 'profile' = 換連線設定檔 | 'model' = 只換模型
+    profileName: '',          // 設定檔名稱
+    modelSelectId: '',        // 模型下拉選單的 DOM id（不同 API 不一樣）
+    modelValue: '',           // 模型值
+    profileWaitMs: 800,       // 切換後等多久再送出，讓連線穩定
+
     // 續寫前清理
     stripEnabled: true,       // 啟用刪詞
     stripList: [],            // [{ t: '字詞或 /regex/flags', on: true }]
@@ -87,6 +94,12 @@ function settings() {
         conf.stripTerms = '';
     }
     if (!Array.isArray(conf.stripList)) conf.stripList = [];
+
+    // 舊版的 useProfile 布林 → switchTarget
+    if (typeof conf.useProfile === 'boolean') {
+        if (conf.useProfile && conf.switchTarget === 'none') conf.switchTarget = 'profile';
+        delete conf.useProfile;
+    }
 
     return conf;
 }
@@ -159,6 +172,129 @@ function analyzeTail(text) {
     return { truncated: reasons.length > 0, reasons };
 }
 
+
+/* ------------------------------------------------------------------ */
+/* 續寫用的連線設定檔                                                    */
+/* ------------------------------------------------------------------ */
+
+/** 讀出所有連線設定檔的名稱。 */
+async function getProfileNames() {
+    const conf = extension_settings.connectionManager;
+    if (Array.isArray(conf?.profiles) && conf.profiles.length) {
+        return conf.profiles.map(p => p?.name).filter(Boolean);
+    }
+    // 備援：問斜線指令
+    const ctx = getContext();
+    try {
+        const res = await ctx.executeSlashCommandsWithOptions?.('/profile-list', {
+            handleParserErrors: true, showOutput: false,
+        });
+        const parsed = JSON.parse(res?.pipe ?? '[]');
+        return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+    } catch (err) {
+        debug('取不到設定檔清單', err);
+        return [];
+    }
+}
+
+/** 目前用的設定檔名稱。 */
+async function getCurrentProfile() {
+    const ctx = getContext();
+    try {
+        const res = await ctx.executeSlashCommandsWithOptions?.('/profile', {
+            handleParserErrors: true, showOutput: false,
+        });
+        const name = String(res?.pipe ?? '').trim();
+        return name && name !== 'undefined' ? name : null;
+    } catch (err) {
+        debug('取不到目前設定檔', err);
+        return null;
+    }
+}
+
+/**
+ * 切到指定設定檔。
+ * @returns {Promise<string|null>} 切換前的設定檔名稱；沒切換就回 null
+ */
+async function switchProfile(target) {
+    const ctx = getContext();
+    if (!target || typeof ctx.executeSlashCommandsWithOptions !== 'function') return null;
+
+    const previous = await getCurrentProfile();
+    if (previous === target) {
+        debug('已經在目標設定檔，不切換');
+        return null;
+    }
+
+    try {
+        await ctx.executeSlashCommandsWithOptions(`/profile ${target}`, {
+            handleParserErrors: true, showOutput: false,
+        });
+        const wait = Math.max(0, Number(settings().profileWaitMs) || 0);
+        if (wait) await new Promise(r => setTimeout(r, wait));
+        debug(`設定檔 ${previous ?? '(未知)'} → ${target}`);
+        return previous;
+    } catch (err) {
+        console.error(LOG, '切換設定檔失敗', err);
+        toastr.warning(`切換到「${target}」失敗，用目前的設定續寫`, '同層續寫');
+        return null;
+    }
+}
+
+
+/* ---- 直接換模型（讀 ST 各後端的模型下拉選單）---- */
+
+/** 找出頁面上所有模型下拉選單。目前 API 的那個會是可見的。 */
+function getModelSelects() {
+    const found = [];
+    $('select[id^="model_"], #openrouter_model, #horde_model').each(function () {
+        const $s = $(this);
+        const count = $s.find('option').length;
+        if (!count) return;
+        found.push({ id: this.id, visible: $s.is(':visible'), count });
+    });
+    // 可見的排前面
+    found.sort((a, b) => Number(b.visible) - Number(a.visible) || b.count - a.count);
+    return found;
+}
+
+/** 目前這個 API 在用的模型選單。 */
+function activeModelSelect() {
+    return getModelSelects()[0] ?? null;
+}
+
+/** 讀出某個選單裡的模型選項。 */
+function getModelOptions(selectId) {
+    if (!selectId) return [];
+    return $(`#${selectId} option`).map(function () {
+        const value = String(this.value ?? '');
+        if (!value) return null;
+        return { value, label: ($(this).text() || value).trim() };
+    }).get().filter(Boolean);
+}
+
+/**
+ * 換模型。
+ * @returns {Promise<{id: string, value: string}|null>} 切換前的值，沒切換就 null
+ */
+async function switchModel(selectId, value) {
+    if (!selectId || !value) return null;
+    const $sel = $(`#${selectId}`);
+    if (!$sel.length) {
+        toastr.warning('找不到模型選單，可能 API 換了。到設定裡重新讀取模型清單。', '同層續寫');
+        return null;
+    }
+    const previous = String($sel.val() ?? '');
+    if (previous === value) {
+        debug('已經是目標模型，不切換');
+        return null;
+    }
+    $sel.val(value).trigger('change');
+    const wait = Math.max(0, Number(settings().profileWaitMs) || 0);
+    if (wait) await new Promise(r => setTimeout(r, wait));
+    debug(`模型 ${previous || '(空)'} → ${value}`);
+    return { id: selectId, value: previous };
+}
 
 /* ------------------------------------------------------------------ */
 /* 續寫前清理                                                           */
@@ -497,7 +633,14 @@ async function continueSameLayer({ source = 'manual', silent = false } = {}) {
 
     busy = true;
     const restore = applyPromptOverrides();
+    let previousProfile = null;
+    let previousModel = null;
     try {
+        if (s.switchTarget === 'profile' && s.profileName) {
+            previousProfile = await switchProfile(s.profileName);
+        } else if (s.switchTarget === 'model' && s.modelValue) {
+            previousModel = await switchModel(s.modelSelectId, s.modelValue);
+        }
         debug(`開始續寫（來源：${source}），目前長度 ${mes.mes?.length ?? 0}`);
         const awaited = await invokeNativeContinue();
         if (!awaited) await waitForGenerationEnd();
@@ -522,6 +665,12 @@ async function continueSameLayer({ source = 'manual', silent = false } = {}) {
         return false;
     } finally {
         restore();
+        if (previousProfile) {
+            await switchProfile(previousProfile);
+        }
+        if (previousModel) {
+            await switchModel(previousModel.id, previousModel.value);
+        }
         busy = false;
     }
 }
@@ -781,6 +930,38 @@ const SETTINGS_HTML = `
             <textarea id="slc_customNudge" class="text_pole textarea_compact" rows="3" placeholder="例：[接續上文繼續寫下去，不要重複已寫過的內容，不要重新開場。]"></textarea>
 
             <hr class="sysHR">
+            <h4>續寫用的模型</h4>
+            <small class="slc_hint">續寫時切換到指定的連線設定檔（API＋模型＋預設集），跑完自動切回原本的。需要先在 ST 的「連線設定檔」裡建好設定檔。</small>
+
+            <label for="slc_switchTarget">續寫時</label>
+            <select id="slc_switchTarget" class="text_pole">
+                <option value="none">用目前的設定（不切換）</option>
+                <option value="profile">切換連線設定檔（API＋模型＋預設集）</option>
+                <option value="model">只換模型</option>
+            </select>
+
+            <div id="slc_profileRow">
+                <div class="slc_list_head">
+                    <span>要用的設定檔</span>
+                    <div id="slc_profileRefresh" class="slc_add fa-solid fa-rotate" title="重新讀取設定檔清單"></div>
+                </div>
+                <select id="slc_profileName" class="text_pole"></select>
+            </div>
+
+            <div id="slc_modelRow">
+                <div class="slc_list_head">
+                    <span>要用的模型</span>
+                    <div id="slc_modelRefresh" class="slc_add fa-solid fa-rotate" title="重新讀取模型清單"></div>
+                </div>
+                <select id="slc_modelSelectId" class="text_pole"></select>
+                <select id="slc_modelValue" class="text_pole"></select>
+                <small class="slc_hint">模型清單直接讀自 ST 目前連線的後端。換了 API 之後記得按重新讀取。</small>
+            </div>
+
+            <label for="slc_profileWaitMs">切換後等待毫秒數</label>
+            <input id="slc_profileWaitMs" class="text_pole" type="number" min="0" max="10000" step="100">
+
+            <hr class="sysHR">
             <h4>續寫前清理</h4>
             <small class="slc_hint">續寫之前把這些字詞從送給 AI 的內容裡拿掉，讓它看不到、往別的方向接著寫。聊天記錄裡的原文不會被改動。一行一條；用 /pattern/flags 可以寫正規表達式；# 開頭是註解。</small>
 
@@ -864,6 +1045,38 @@ function bindSettingsUI() {
         saveSettings();
     });
 
+    $('#slc_switchTarget').val(s.switchTarget).on('change', function () {
+        settings().switchTarget = String($(this).val());
+        saveSettings();
+        updateSwitchRows();
+        if (settings().switchTarget === 'model') renderModelSelects();
+        if (settings().switchTarget === 'profile') renderProfileSelect();
+    });
+
+    $('#slc_modelSelectId').on('change', function () {
+        settings().modelSelectId = String($(this).val());
+        settings().modelValue = '';
+        saveSettings();
+        renderModelOptions();
+    });
+
+    $('#slc_modelValue').on('change', function () {
+        settings().modelValue = String($(this).val());
+        saveSettings();
+    });
+
+    $('#slc_modelRefresh').on('click', () => {
+        renderModelSelects();
+        toastr.info('已重新讀取模型清單', '同層續寫');
+    });
+
+    $('#slc_profileName').on('change', function () {
+        settings().profileName = String($(this).val());
+        saveSettings();
+    });
+
+    $('#slc_profileRefresh').on('click', () => renderProfileSelect());
+
     $('#slc_stripScope').val(s.stripScope).on('change', function () {
         settings().stripScope = String($(this).val());
         saveSettings();
@@ -879,7 +1092,7 @@ function bindSettingsUI() {
         saveSettings();
     });
 
-    for (const key of ['maxAutoRetries', 'minLength', 'stripTailChars']) {
+    for (const key of ['maxAutoRetries', 'minLength', 'stripTailChars', 'profileWaitMs']) {
         $(`#slc_${key}`).val(s[key]).on('input', function () {
             const v = Number($(this).val());
             if (Number.isFinite(v)) {
@@ -920,6 +1133,85 @@ function bindSettingsUI() {
     renderVersionLine();
     renderStripList();
     bindStripList();
+    renderProfileSelect();
+    renderModelSelects();
+    updateSwitchRows();
+}
+
+function renderModelSelects() {
+    const s = settings();
+    const $which = $('#slc_modelSelectId');
+    if (!$which.length) return;
+
+    const selects = getModelSelects();
+    $which.empty();
+    if (!selects.length) {
+        $which.append($('<option value=""></option>').text('（找不到模型選單）'));
+        $('#slc_modelValue').empty().append($('<option value=""></option>').text('（無）'));
+        return;
+    }
+
+    for (const sel of selects) {
+        const label = `${sel.id.replace(/^model_/, '').replace(/_select$/, '')}（${sel.count}）${sel.visible ? ' ←目前' : ''}`;
+        $which.append($('<option></option>').attr('value', sel.id).text(label));
+    }
+
+    const chosen = selects.some(x => x.id === s.modelSelectId) ? s.modelSelectId : selects[0].id;
+    $which.val(chosen);
+    if (chosen !== s.modelSelectId) {
+        s.modelSelectId = chosen;
+        saveSettings();
+    }
+    renderModelOptions();
+}
+
+function renderModelOptions() {
+    const s = settings();
+    const $val = $('#slc_modelValue');
+    if (!$val.length) return;
+
+    const options = getModelOptions(s.modelSelectId);
+    $val.empty();
+    if (!options.length) {
+        $val.append($('<option value=""></option>').text('（這個選單沒有選項）'));
+        return;
+    }
+    $val.append($('<option value=""></option>').text('（不指定）'));
+    for (const o of options) {
+        $val.append($('<option></option>').attr('value', o.value).text(o.label));
+    }
+    if (s.modelValue && !options.some(o => o.value === s.modelValue)) {
+        $val.append($('<option></option>').attr('value', s.modelValue).text(`${s.modelValue}（清單裡沒有）`));
+    }
+    $val.val(s.modelValue ?? '');
+}
+
+function updateSwitchRows() {
+    const t = settings().switchTarget;
+    $('#slc_profileRow').toggle(t === 'profile');
+    $('#slc_modelRow').toggle(t === 'model');
+}
+
+async function renderProfileSelect() {
+    const $sel = $('#slc_profileName');
+    if (!$sel.length) return;
+    const saved = settings().profileName;
+    const names = await getProfileNames();
+
+    $sel.empty();
+    if (!names.length) {
+        $sel.append($('<option value=""></option>').text('（找不到連線設定檔）'));
+        return;
+    }
+    $sel.append($('<option value=""></option>').text('（不指定）'));
+    for (const n of names) {
+        $sel.append($('<option></option>').attr('value', n).text(n));
+    }
+    // 存的設定檔被刪掉時保留選項，避免看起來像被清空
+    if (saved && !names.includes(saved)) {
+        $sel.append($('<option></option>').attr('value', saved).text(`${saved}（已不存在）`));
+    }
+    $sel.val(saved ?? '');
 }
 
 function renderStripList() {
