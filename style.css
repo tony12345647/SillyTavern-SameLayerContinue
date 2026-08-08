@@ -30,3 +30,56 @@
     opacity: 0.6;
     font-weight: normal;
 }
+
+.same-layer-continue-settings .slc_list_head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin: 8px 0 4px;
+}
+
+.same-layer-continue-settings .slc_add {
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 4px;
+    opacity: 0.8;
+}
+
+.same-layer-continue-settings .slc_add:hover {
+    opacity: 1;
+    background-color: rgba(255, 255, 255, 0.1);
+}
+
+.same-layer-continue-settings .slc_term_list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.same-layer-continue-settings .slc_term_row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.same-layer-continue-settings .slc_term_input {
+    flex: 1;
+    min-width: 0;
+}
+
+.same-layer-continue-settings .slc_term_del {
+    cursor: pointer;
+    padding: 4px 6px;
+    opacity: 0.55;
+}
+
+.same-layer-continue-settings .slc_term_del:hover {
+    opacity: 1;
+    color: var(--warning, #e06c6c);
+}
+
+.same-layer-continue-settings .slc_empty {
+    opacity: 0.5;
+    padding: 6px 2px;
+    font-size: 0.9em;
+}

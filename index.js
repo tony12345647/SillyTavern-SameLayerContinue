@@ -36,11 +36,10 @@ const defaultSettings = {
     // 行為
     // 續寫前清理
     stripEnabled: true,       // 啟用刪詞
-    stripTerms: '',           // 一行一條，支援 /regex/flags
-    stripMode: 'prompt',      // 'prompt' = 只從送給AI的內容刪，聊天記錄保留原文 | 'message' = 直接改訊息
+    stripList: [],            // [{ t: '字詞或 /regex/flags', on: true }]
+    stripTerms: '',           // 舊版格式，載入時自動轉成 stripList
     stripScope: 'all',        // 'all' = 整篇 | 'tail' = 只處理結尾
     stripTailChars: 300,      // scope=tail 時處理最後幾個字
-    stripBackup: true,        // 清理前備份原文，可還原
 
     trimTrailing: true,       // 續寫前先去掉結尾多餘空白
     syncSwipe: true,          // 續寫後把結果同步回目前的 swipe
@@ -76,7 +75,20 @@ function settings() {
             extension_settings[MODULE_NAME][k] = v;
         }
     }
-    return extension_settings[MODULE_NAME];
+    const conf = extension_settings[MODULE_NAME];
+
+    // 舊版的多行文字框 → 新版清單，轉一次就好
+    if (typeof conf.stripTerms === 'string' && conf.stripTerms.trim() && !conf.stripList?.length) {
+        conf.stripList = conf.stripTerms
+            .split('\n')
+            .map(l => l.trim())
+            .filter(l => l && !l.startsWith('#'))
+            .map(t => ({ t, on: true }));
+        conf.stripTerms = '';
+    }
+    if (!Array.isArray(conf.stripList)) conf.stripList = [];
+
+    return conf;
 }
 
 function saveSettings() {
@@ -152,13 +164,19 @@ function analyzeTail(text) {
 /* 續寫前清理                                                           */
 /* ------------------------------------------------------------------ */
 
-/** 把設定裡的刪除清單解析成 RegExp 陣列。純文字會自動跳脫。 */
+/** 目前生效的字詞（跳過關掉的和空白的）。 */
+function activeTerms() {
+    const list = settings().stripList;
+    return (Array.isArray(list) ? list : [])
+        .filter(e => e && e.on !== false)
+        .map(e => String(e.t ?? '').trim())
+        .filter(Boolean);
+}
+
+/** 把清單解析成 RegExp 陣列。純文字自動跳脫，/pattern/flags 當正規表達式。 */
 function parseStripTerms() {
-    const raw = String(settings().stripTerms ?? '');
     const patterns = [];
-    for (const line of raw.split('\n')) {
-        const t = line.trim();
-        if (!t || t.startsWith('#')) continue;
+    for (const t of activeTerms()) {
         const asRegex = t.match(/^\/(.+)\/([gimsuy]*)$/);
         try {
             if (asRegex) {
@@ -229,9 +247,8 @@ function refreshMessageBlock(idx, mes) {
 /**
  * 續寫前把刪除清單套到最後一層訊息上。
  *
- * stripMode='prompt' 時這是暫時的：訊息會先被改成刪除後的版本送去續寫，
- * 生成結束再由 finalizeStrip() 把原文接回來，聊天記錄看起來沒被動過。
- * stripMode='message' 時就是永久改掉，靠備份還原。
+ * 這是暫時的：訊息先被改成刪除後的版本送去續寫，生成結束由 finalizeStrip()
+ * 把原文接回來，聊天記錄看起來沒被動過，AI 卻沒看到那些字。
  *
  * @returns {{applied: boolean, count: number, original: string|null, sent: string|null}}
  */
@@ -248,25 +265,19 @@ function prepareStrip() {
     const { text, count } = stripFromText(original);
     if (!count || text === original) return none;
 
-    if (s.stripMode === 'message' && s.stripBackup) {
-        mes.extra = mes.extra || {};
-        mes.extra.slc_backup = original;
-    }
-
     mes.mes = text;
     if (Array.isArray(mes.swipes) && Number.isInteger(mes.swipe_id)) {
         mes.swipes[mes.swipe_id] = text;
     }
-    debug(`清理移除 ${count} 處，模式 ${s.stripMode}`);
+    debug(`送出前移除 ${count} 處`);
     return { applied: true, count, original, sent: text, idx };
 }
 
 /**
- * 生成結束後收尾。prompt 模式會把原文接回去，只保留 AI 新寫的那一段。
+ * 生成結束後把原文接回去，只保留 AI 新寫的那一段。
  */
 function finalizeStrip(state) {
-    const s = settings();
-    if (!state?.applied || s.stripMode !== 'prompt') return;
+    if (!state?.applied) return;
 
     const item = lastAiMessage();
     if (!item) return;
@@ -284,7 +295,7 @@ function finalizeStrip(state) {
     }
 
     if (addition === null) {
-        toastr.warning('接不回原文（內容和送出時對不上），這次的刪除留在訊息裡了。可按「還原上次清理」處理。', '同層續寫');
+        toastr.warning('接不回原文（內容和送出時對不上），被刪掉的字暫時留在訊息裡。按「還原原文」可以救回來。', '同層續寫');
         mes.extra = mes.extra || {};
         mes.extra.slc_backup = state.original;
         debug('finalizeStrip 對不上，保留刪除後版本');
@@ -299,26 +310,7 @@ function finalizeStrip(state) {
     debug(`已接回原文，新增 ${addition.length} 字`);
 }
 
-/** 直接把刪除清單永久套用到訊息（面板上的「直接清理訊息」按鈕用）。 */
-function applyStripToLastMessage({ render = true } = {}) {
-    const item = lastAiMessage();
-    if (!item) return { applied: false, count: 0 };
-    const { idx, mes } = item;
-    const original = mes.mes;
-    const { text, count } = stripFromText(original);
-    if (!count || text === original) return { applied: false, count: 0 };
-
-    mes.extra = mes.extra || {};
-    mes.extra.slc_backup = original;
-    mes.mes = text;
-    if (Array.isArray(mes.swipes) && Number.isInteger(mes.swipe_id)) {
-        mes.swipes[mes.swipe_id] = text;
-    }
-    if (render) refreshMessageBlock(idx, mes);
-    return { applied: true, count };
-}
-
-/** 還原最近一次清理。 */
+/** 還原原文（接不回去時的救援）。 */
 function restoreLastStrip() {
     const item = lastAiMessage();
     if (!item) {
@@ -328,7 +320,7 @@ function restoreLastStrip() {
     const { idx, mes } = item;
     const backup = mes.extra?.slc_backup;
     if (typeof backup !== 'string') {
-        toastr.warning('這則訊息沒有清理備份可以還原');
+        toastr.warning('這則訊息沒有備份可以還原');
         return;
     }
     mes.mes = backup;
@@ -339,7 +331,7 @@ function restoreLastStrip() {
     refreshMessageBlock(idx, mes);
     const ctx = getContext();
     (ctx.saveChatConditional ?? ctx.saveChat)?.();
-    toastr.success('已還原清理前的內容', '同層續寫');
+    toastr.success('已還原原文', '同層續寫');
 }
 
 /* ------------------------------------------------------------------ */
@@ -515,7 +507,7 @@ async function continueSameLayer({ source = 'manual', silent = false } = {}) {
     } catch (err) {
         console.error(LOG, err);
         // 生成失敗時，prompt 模式要把原文放回去，不能留下被刪過的版本
-        if (stripState.applied && settings().stripMode === 'prompt') {
+        if (stripState.applied) {
             const item2 = lastAiMessage();
             if (item2 && item2.mes.mes === (stripState.sentTrimmed ?? stripState.sent)) {
                 item2.mes.mes = stripState.original;
@@ -790,19 +782,17 @@ const SETTINGS_HTML = `
 
             <hr class="sysHR">
             <h4>續寫前清理</h4>
-            <small class="slc_hint">續寫之前先把這些字詞從上一層內容裡拿掉，再讓 AI 接著寫。一行一條；用 /pattern/flags 可以寫正規表達式；# 開頭是註解。</small>
+            <small class="slc_hint">續寫之前把這些字詞從送給 AI 的內容裡拿掉，讓它看不到、往別的方向接著寫。聊天記錄裡的原文不會被改動。一行一條；用 /pattern/flags 可以寫正規表達式；# 開頭是註解。</small>
 
             <label class="checkbox_label" for="slc_stripEnabled">
                 <input id="slc_stripEnabled" type="checkbox"><span>啟用清理</span>
             </label>
 
-            <textarea id="slc_stripTerms" class="text_pole textarea_compact" rows="6" placeholder="（待續）&#10;※&#10;/\\[系統[^\\]]*\\]/&#10;# 井字號開頭這行不會生效"></textarea>
-
-            <label for="slc_stripMode">刪除範圍</label>
-            <select id="slc_stripMode" class="text_pole">
-                <option value="prompt">只從送給 AI 的內容刪，聊天記錄保留原文</option>
-                <option value="message">直接從訊息刪掉（永久，可還原）</option>
-            </select>
+            <div class="slc_list_head">
+                <span>要刪除的字詞</span>
+                <div id="slc_stripAdd" class="slc_add fa-solid fa-plus" title="新增一條"></div>
+            </div>
+            <div id="slc_stripList" class="slc_term_list"></div>
 
             <label for="slc_stripScope">掃描範圍</label>
             <select id="slc_stripScope" class="text_pole">
@@ -813,14 +803,11 @@ const SETTINGS_HTML = `
             <label for="slc_stripTailChars">結尾範圍的字數</label>
             <input id="slc_stripTailChars" class="text_pole" type="number" min="10" max="5000" step="10">
 
-            <label class="checkbox_label" for="slc_stripBackup">
-                <input id="slc_stripBackup" type="checkbox"><span>清理前備份原文（可還原）</span>
-            </label>
-
             <div class="flex-container flexGap5">
-                <input id="slc_stripNow" class="menu_button" type="button" value="直接清理訊息">
-                <input id="slc_stripRestore" class="menu_button" type="button" value="還原上次清理">
+                <input id="slc_stripPreview" class="menu_button" type="button" value="預覽送給 AI 的內容">
+                <input id="slc_stripRestore" class="menu_button" type="button" value="還原原文">
             </div>
+            <textarea id="slc_previewBox" class="text_pole textarea_compact" rows="5" readonly placeholder="按上面的預覽鍵，這裡會顯示刪除之後、實際要送給 AI 的那份內容。聊天記錄不會被改動。"></textarea>
 
             <hr class="sysHR">
             <h4>續寫行為</h4>
@@ -860,7 +847,7 @@ function bindSettingsUI() {
     const checkboxes = [
         'enabled', 'showWandButton', 'autoDetect', 'detectPunctuation',
         'detectUnclosed', 'detectCodeBlock', 'trimTrailing', 'syncSwipe', 'debug',
-        'forcePrefill', 'checkUpdateOnStart', 'stripEnabled', 'stripBackup',
+        'forcePrefill', 'checkUpdateOnStart', 'stripEnabled',
     ];
     for (const key of checkboxes) {
         const $el = $(`#slc_${key}`);
@@ -877,18 +864,8 @@ function bindSettingsUI() {
         saveSettings();
     });
 
-    $('#slc_stripMode').val(s.stripMode).on('change', function () {
-        settings().stripMode = String($(this).val());
-        saveSettings();
-    });
-
     $('#slc_stripScope').val(s.stripScope).on('change', function () {
         settings().stripScope = String($(this).val());
-        saveSettings();
-    });
-
-    $('#slc_stripTerms').val(s.stripTerms).on('input', function () {
-        settings().stripTerms = String($(this).val());
         saveSettings();
     });
 
@@ -927,20 +904,90 @@ function bindSettingsUI() {
     });
 
     $('#slc_run').on('click', () => continueSameLayer({ source: 'settings' }));
-    $('#slc_stripNow').on('click', () => {
-        const r = applyStripToLastMessage({ render: true });
-        if (r.applied) {
-            const ctx = getContext();
-            (ctx.saveChatConditional ?? ctx.saveChat)?.();
-            toastr.success(`刪除了 ${r.count} 處`, '已直接改動訊息');
-        } else {
-            toastr.info('沒有符合的字詞，或清理沒有啟用', '同層續寫');
+    $('#slc_stripPreview').on('click', () => {
+        const item = lastAiMessage();
+        if (!item) {
+            toastr.warning('最後一則不是角色訊息');
+            return;
         }
+        const { text, count } = stripFromText(item.mes.mes);
+        $('#slc_previewBox').val(text);
+        toastr.info(count ? `會移除 ${count} 處` : '沒有符合的字詞', '預覽');
     });
     $('#slc_stripRestore').on('click', () => restoreLastStrip());
     $('#slc_check').on('click', () => checkForUpdate({ silent: false }));
     $('#slc_update').on('click', () => runUpdate());
     renderVersionLine();
+    renderStripList();
+    bindStripList();
+}
+
+function renderStripList() {
+    const $list = $('#slc_stripList');
+    if (!$list.length) return;
+    $list.empty();
+
+    const list = settings().stripList;
+    if (!list.length) {
+        $list.append($('<div class="slc_empty"></div>').text('還沒有字詞。點上面的 + 新增。'));
+        return;
+    }
+
+    list.forEach((item, i) => {
+        const $row = $('<div class="slc_term_row"></div>').attr('data-idx', i);
+        const $on = $('<input type="checkbox" title="暫時停用這一條">').prop('checked', item.on !== false);
+        const $txt = $('<input type="text" class="text_pole slc_term_input">')
+            .attr('placeholder', '字詞，或 /regex/flags')
+            .val(String(item.t ?? ''));
+        const $del = $('<div class="slc_term_del fa-solid fa-trash-can" title="刪除這一條"></div>');
+        $row.append($on, $txt, $del);
+        $list.append($row);
+    });
+}
+
+function bindStripList() {
+    const $list = $('#slc_stripList');
+
+    $list.on('input', '.slc_term_input', function () {
+        const i = Number($(this).closest('.slc_term_row').attr('data-idx'));
+        const list = settings().stripList;
+        if (list[i]) {
+            list[i].t = String($(this).val());
+            saveSettings();
+        }
+    });
+
+    $list.on('change', 'input[type="checkbox"]', function () {
+        const i = Number($(this).closest('.slc_term_row').attr('data-idx'));
+        const list = settings().stripList;
+        if (list[i]) {
+            list[i].on = $(this).prop('checked');
+            saveSettings();
+        }
+    });
+
+    $list.on('click', '.slc_term_del', function () {
+        const i = Number($(this).closest('.slc_term_row').attr('data-idx'));
+        settings().stripList.splice(i, 1);
+        saveSettings();
+        renderStripList();
+    });
+
+    // Enter 直接再開一條，方便連續輸入
+    $list.on('keydown', '.slc_term_input', function (e) {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        addStripTerm();
+    });
+
+    $('#slc_stripAdd').on('click', () => addStripTerm());
+}
+
+function addStripTerm() {
+    settings().stripList.push({ t: '', on: true });
+    saveSettings();
+    renderStripList();
+    $('#slc_stripList .slc_term_row').last().find('.slc_term_input').trigger('focus');
 }
 
 function refreshWandButton() {
